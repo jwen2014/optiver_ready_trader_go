@@ -31,7 +31,7 @@ MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 
 # Custom Config
 NUM_THREADS = 5
-LOT_SIZE = 100
+LOT_SIZE = 25
 # FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, TIC_CAP_WEIGHT = 0.2, 0.3, 0.5
 FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, TIC_CAP_WEIGHT = 0.2, 0.3, 0.5
 class AutoTrader(BaseAutoTrader):
@@ -60,7 +60,8 @@ class AutoTrader(BaseAutoTrader):
         self.is_buyer_market_static = -1
 
         self.futs = list()
-
+        self.round_count = 0
+        self.fut_position = 0
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
 
@@ -79,6 +80,11 @@ class AutoTrader(BaseAutoTrader):
         the number of lots filled at that price.
         """
         self.logger.info(f"received hedge filled for order({client_order_id}) with average price {price} and volume {volume}")
+        if client_order_id in self.bids:
+            self.fut_position+=volume
+        if client_order_id in self.asks:
+            self.fut_position-=volume        
+        self.round_count = 0    
 
     def on_order_book_update_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                      ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
@@ -92,54 +98,72 @@ class AutoTrader(BaseAutoTrader):
         self.logger.info(f"received order book for instrument {instrument} with sequence number {sequence_number}")
 
         if instrument == Instrument.FUTURE:
-            price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
-            new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
-            new_ask_price = ask_prices[0] + price_adjustment if ask_prices[0] != 0 else 0
+        
+            if self.round_count != 0:
+                print(self.round_count)
+                self.round_count+=1
+            if self.round_count == 100:
+                net_diff = self.position + self.fut_position
+                order_id = next(self.order_ids)
+                if net_diff > 0:
+                    self.send_hedge_order(order_id, Side.ASK, MIN_BID_NEAREST_TICK, net_diff)
+                    self.logger.info(f"sending future sell order({order_id}) of price {MIN_BID_NEAREST_TICK} and size {net_diff}")
 
-            buy_total_cap, sell_total_cap = self.calculate_sides_capital()
-            is_buyer_market = buy_total_cap > sell_total_cap
-            is_seller_market = buy_total_cap < sell_total_cap
-            if self.is_buyer_market_static != -1:
-                capital_dicrection_change = self.is_buyer_market_static != is_buyer_market
-            else:
-                capital_dicrection_change = True
-            # Cancel any current orders if needed
-            # should_cancel_bid = self.bid_id != 0 and new_bid_price not in (self.bid_price, 0)
-            # if is_buy_market and should_cancel_bid:
-            #     self.send_cancel_order(self.ask_id) # cancel the reverse order 
-            #     self.send_cancel_order(self.bid_id) # cancel the current order 
-            #     self.bid_id = 0
-            # should_cancel_ask = self.ask_id != 0 and new_ask_price not in (self.ask_price, 0)
-            # if is_sell_market and should_cancel_ask:
-            #     self.send_cancel_order(self.bid_id) # cancel the reverse order 
-            #     self.send_cancel_order(self.ask_id) # cancel the current order 
-            #     self.ask_id = 0
+                elif net_diff <0:
+                    self.send_hedge_order(order_id, Side.BID, MIN_BID_NEAREST_TICK, -net_diff)
+                    self.logger.info(f"sending future buy order({order_id}) of price {MAX_ASK_NEAREST_TICK} and size {-net_diff}")
 
-            # Execute available orders
-            should_buy = self.bid_id == 0 and new_bid_price != 0 and self.position < POSITION_LIMIT and capital_dicrection_change
-            if is_buyer_market and should_buy:
-                self.bid_id = next(self.order_ids)
-                self.bid_price = new_bid_price
-                order_size = min(LOT_SIZE, abs(POSITION_LIMIT-self.position))
-                self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, order_size, Lifespan.FILL_AND_KILL)
-                self.bids.add(self.bid_id)
-                self.logger.info(f"sending buy order({self.bid_id}) at {new_bid_price} of size {order_size}")
+            elif self.round_count < 100:
+                self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
+                self.fut_book[Side.BID] = (bid_prices, bid_volumes)
+                price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
+                new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
+                new_ask_price = ask_prices[0] + price_adjustment if ask_prices[0] != 0 else 0
 
-            should_sell = self.ask_id == 0 and new_ask_price != 0 and self.position > -POSITION_LIMIT and capital_dicrection_change
-            if is_seller_market and should_sell:
-                self.ask_id = next(self.order_ids)
-                self.ask_price = new_ask_price
-                order_size = min(LOT_SIZE, abs(-POSITION_LIMIT-self.position))
-                self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, order_size, Lifespan.FILL_AND_KILL)
-                self.asks.add(self.ask_id)
-                self.logger.info(f"sending sell order({self.ask_id}) at {new_ask_price} of size {order_size}")
+                buy_total_cap, sell_total_cap = self.calculate_sides_capital()
+                is_buyer_market = buy_total_cap > sell_total_cap
+                is_seller_market = buy_total_cap < sell_total_cap
+                if self.is_buyer_market_static != -1:
+                    capital_dicrection_change = self.is_buyer_market_static != is_buyer_market
+                else:
+                    capital_dicrection_change = True
+                # Cancel any current orders if needed
+                # should_cancel_bid = self.bid_id != 0 and new_bid_price not in (self.bid_price, 0)
+                # if is_buy_market and should_cancel_bid:
+                #     self.send_cancel_order(self.ask_id) # cancel the reverse order 
+                #     self.send_cancel_order(self.bid_id) # cancel the current order 
+                #     self.bid_id = 0
+                # should_cancel_ask = self.ask_id != 0 and new_ask_price not in (self.ask_price, 0)
+                # if is_sell_market and should_cancel_ask:
+                #     self.send_cancel_order(self.bid_id) # cancel the reverse order 
+                #     self.send_cancel_order(self.ask_id) # cancel the current order 
+                #     self.ask_id = 0
 
-            # Update local order book
-            self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
-            self.fut_book[Side.BID] = (bid_prices, bid_volumes)
-            # self.execute_order_by_fut(bid_prices, ask_prices)
-            self.is_buyer_market_static = is_buyer_market
-            
+                # Execute available orders
+                should_buy = self.bid_id == 0 and new_bid_price != 0 and self.position < POSITION_LIMIT and capital_dicrection_change
+                if is_buyer_market and should_buy:
+                    self.bid_id = next(self.order_ids)
+                    self.bid_price = new_bid_price
+                    order_size = min(LOT_SIZE, abs(POSITION_LIMIT-self.position))
+                    self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, order_size, Lifespan.FILL_AND_KILL)
+                    self.bids.add(self.bid_id)
+                    self.logger.info(f"sending buy order({self.bid_id}) at {new_bid_price} of size {order_size}")
+
+                should_sell = self.ask_id == 0 and new_ask_price != 0 and self.position > -POSITION_LIMIT and capital_dicrection_change
+                if is_seller_market and should_sell:
+                    self.ask_id = next(self.order_ids)
+                    self.ask_price = new_ask_price
+                    order_size = min(LOT_SIZE, abs(-POSITION_LIMIT-self.position))
+                    self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, order_size, Lifespan.FILL_AND_KILL)
+                    self.asks.add(self.ask_id)
+                    self.logger.info(f"sending sell order({self.ask_id}) at {new_ask_price} of size {order_size}")
+
+                # Update local order book
+                self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
+                self.fut_book[Side.BID] = (bid_prices, bid_volumes)
+                # self.execute_order_by_fut(bid_prices, ask_prices)
+                self.is_buyer_market_static = is_buyer_market
+                
         elif instrument == Instrument.ETF:
             # Update local order book
             self.etf_book[Side.ASK] = (ask_prices, ask_volumes)
@@ -233,17 +257,31 @@ class AutoTrader(BaseAutoTrader):
         the number of lots filled at that price.
         """
         self.logger.info(f"received order({client_order_id} filled of price {price} and volume {volume}")
+        if self.round_count !=0:
+            if self.position == -self.fut_position:
+                self.round_count = 0
+        else:
+            if self.position != self.fut_position:
+                self.round_count = 1
+        if client_order_id in self.bids:
+            self.position += volume
+        elif client_order_id in self.asks:
+            self.position -= volume
+        """
         if client_order_id in self.bids:
             self.position += volume
             order_id = next(self.order_ids)
             self.send_hedge_order(order_id, Side.ASK, MIN_BID_NEAREST_TICK, volume)
             self.logger.info(f"sending future sell order({order_id}) of price {MIN_BID_NEAREST_TICK} and size {volume}")
-        elif client_order_id in self.asks:
-            self.position -= volume
+        """
+
+        """
+         elif client_order_id in self.asks:
+            self.position -= volume           
             order_id = next(self.order_ids)
             self.send_hedge_order(order_id, Side.BID, MAX_ASK_NEAREST_TICK, volume)
             self.logger.info(f"sending future buy order({order_id}) of price {MAX_ASK_NEAREST_TICK} and size {volume}")
-
+        """
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
         """Called when the status of one of your orders changes.
