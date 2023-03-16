@@ -62,6 +62,8 @@ class AutoTrader(BaseAutoTrader):
         self.futs = list()
         self.round_count = 0
         self.fut_position = 0
+        self.fut_bids = set()
+        self.fut_asks = set()
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
 
@@ -80,11 +82,11 @@ class AutoTrader(BaseAutoTrader):
         the number of lots filled at that price.
         """
         self.logger.info(f"received hedge filled for order({client_order_id}) with average price {price} and volume {volume}")
-        if client_order_id in self.bids:
+        if client_order_id in self.fut_bids:
             self.fut_position+=volume
-        if client_order_id in self.asks:
+        if client_order_id in self.fut_asks:
             self.fut_position-=volume        
-        self.round_count = 0    
+
 
     def on_order_book_update_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                      ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
@@ -98,22 +100,26 @@ class AutoTrader(BaseAutoTrader):
         self.logger.info(f"received order book for instrument {instrument} with sequence number {sequence_number}")
 
         if instrument == Instrument.FUTURE:
-        
+            print(self.position,self.fut_position)
+            if self.position == -self.fut_position:
+                self.round_count = 0            
             if self.round_count != 0:
                 print(self.round_count)
                 self.round_count+=1
-            if self.round_count == 100:
+            if self.round_count == 50:
                 net_diff = self.position + self.fut_position
                 order_id = next(self.order_ids)
                 if net_diff > 0:
                     self.send_hedge_order(order_id, Side.ASK, MIN_BID_NEAREST_TICK, net_diff)
+                    self.fut_asks.add(order_id)
                     self.logger.info(f"sending future sell order({order_id}) of price {MIN_BID_NEAREST_TICK} and size {net_diff}")
 
                 elif net_diff <0:
-                    self.send_hedge_order(order_id, Side.BID, MIN_BID_NEAREST_TICK, -net_diff)
+                    self.send_hedge_order(order_id, Side.BID, MAX_ASK_NEAREST_TICK, -net_diff)
+                    self.fut_bids.add(order_id)
                     self.logger.info(f"sending future buy order({order_id}) of price {MAX_ASK_NEAREST_TICK} and size {-net_diff}")
 
-            elif self.round_count < 100:
+            elif self.round_count < 50:
                 self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
                 self.fut_book[Side.BID] = (bid_prices, bid_volumes)
                 price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
@@ -261,7 +267,7 @@ class AutoTrader(BaseAutoTrader):
             if self.position == -self.fut_position:
                 self.round_count = 0
         else:
-            if self.position != self.fut_position:
+            if self.position != -self.fut_position:
                 self.round_count = 1
         if client_order_id in self.bids:
             self.position += volume
