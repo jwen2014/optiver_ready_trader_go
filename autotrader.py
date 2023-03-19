@@ -27,6 +27,7 @@ from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, M
 
 # Original Config
 POSITION_LIMIT = 100
+UNHEDGED_LOT_LIMIT = 10
 TICK_SIZE_IN_CENTS = 100
 MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
@@ -37,8 +38,8 @@ LOT_FOLLOWER_RATIO = 0.01
 FUT_PREMIUM_FACTOR = 1
 FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, TIC_CAP_WEIGHT = 0.4, 0.3, 0.3
 
-MARKET_EXECUTOR_CHECK_INTERVAL = 0.2
-TIME_BEFORE_MARKET_ORDER = 2
+MARKET_EXECUTOR_CHECK_INTERVAL = 0.3
+TIME_BEFORE_MARKET_ORDER = 30
 CNT_TIME_BEFORE_MARKET_ORDER = TIME_BEFORE_MARKET_ORDER // EVENT_INTERVAL
 
 class AutoTrader(BaseAutoTrader):
@@ -77,7 +78,6 @@ class AutoTrader(BaseAutoTrader):
         If the error pertains to a particular order, then the client_order_id
         will identify that order, otherwise the client_order_id will be zero.
         """
-        self.logger.warning(f"error with order {client_order_id}: {error_message.decode()}")
         if client_order_id != 0 and (client_order_id in self.bids or client_order_id in self.asks):
             self.on_order_status_message(client_order_id, 0, 0, 0)
 
@@ -103,41 +103,40 @@ class AutoTrader(BaseAutoTrader):
                     self.fut_ask_orders.pop(client_order_id)
         finally:
             self.order_lock.release()
-        self.logger.info(f"received hedge filled for order({client_order_id}) with average price {price} and volume {volume}")
 
     def _market_order_executor(self):
         """" Check current position by a preset interval and send market orders if needed """
         while True:
-            should_wait = False
             if (self.msg_cnt > CNT_TIME_BEFORE_MARKET_ORDER):
                 self.order_lock.acquire()
                 try:
                     total = self.position + self.fut_position
-                    if abs(total) > POSITION_LIMIT:
+                    if abs(total) > UNHEDGED_LOT_LIMIT:
                         if total < 0:
                             side, price = Side.BID, MAX_ASK_NEAREST_TICK
                             for id in self.fut_bid_orders:
                                 if id in self.completed_ids:
                                     self.fut_bid_orders.pop(id)
-                                else:
+                                elif id is not None:
                                     self.send_cancel_order(id)
-                                    should_wait = True
                         else:
                             side, price = Side.ASK, MIN_BID_NEAREST_TICK
-                            for id in self.fut_bid_orders:
+                            for id in self.fut_ask_orders:
                                 if id in self.completed_ids:
-                                    self.fut_bid_orders.pop(id)
-                                else:
+                                    self.fut_ask_orders.pop(id)
+                                elif id is not None:
                                     self.send_cancel_order(id)
-                                    should_wait = True
 
-                        if not should_wait:
-                            # Sending a market order
-                            order_id = next(self.order_ids)
-                            volume = abs(total) - (POSITION_LIMIT-1)
-                            self.send_hedge_order(order_id, side, price, volume)
-                            self.msg_cnt = 0
-                            self.logger.info(f"sending future {side} market order({order_id}) of price {MIN_BID_NEAREST_TICK} and size {volume}")
+                        # Sending a market order
+                        sleep(0.4)
+                        order_id = next(self.order_ids)
+                        volume = abs(total) - (UNHEDGED_LOT_LIMIT-1)
+                        self.send_hedge_order(order_id, side, price, volume)
+                        if side == Side.ASK:
+                            self.fut_ask_orders[order_id] = volume
+                        else:
+                            self.fut_bid_orders[order_id] = volume
+                        self.msg_cnt = 0
                 finally:
                     self.order_lock.release()
             sleep(MARKET_EXECUTOR_CHECK_INTERVAL)
@@ -157,11 +156,13 @@ class AutoTrader(BaseAutoTrader):
             # Update local order book
             self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
             self.fut_book[Side.BID] = (bid_prices, bid_volumes)
+            return
         elif instrument == Instrument.ETF:
             # Update local order book
             self.etf_book[Side.ASK] = (ask_prices, ask_volumes)
             self.etf_book[Side.BID] = (bid_prices, bid_volumes)
             # self.execute_order_by_etf(bid_prices, ask_prices)
+            
 
         # Estimate market inclination and set order size accordingly
         buy_total_cap, sell_total_cap = self.calculate_sides_capital()
@@ -200,12 +201,10 @@ class AutoTrader(BaseAutoTrader):
                 target_order_size = int(volumn * adjusted_ratio)
                 order_size = min(target_order_size, abs(POSITION_LIMIT-self.position))
                 if order_size == 0:
-                    self.logger.info(f"neutral market inclination, no order should be sent")
                     return
                 self.bid_id = next(self.order_ids)
-                self.send_insert_order(self.bid_id, Side.BUY, self.bid_price, order_size, Lifespan.FILL_AND_KILL)
+                self.send_insert_order(self.bid_id, Side.BUY, self.bid_price, order_size, Lifespan.GOOD_FOR_DAY)
                 self.bids.add(self.bid_id)
-                self.logger.info(f"sending buy order({self.bid_id}) at {self.bid_price} of size {order_size}")
 
             should_sell = self.ask_id == 0 and self.position > -POSITION_LIMIT
             if is_seller_market and should_sell:
@@ -214,15 +213,12 @@ class AutoTrader(BaseAutoTrader):
                 target_order_size = int(volumn * adjusted_ratio)
                 order_size = min(target_order_size, abs(-POSITION_LIMIT-self.position))
                 if order_size == 0:
-                    self.logger.info(f"neutral market inclination, no order should be sent")
                     return
                 self.ask_id = next(self.order_ids)
-                self.send_insert_order(self.ask_id, Side.SELL, self.ask_price, order_size, Lifespan.FILL_AND_KILL)
+                self.send_insert_order(self.ask_id, Side.SELL, self.ask_price, order_size, Lifespan.GOOD_FOR_DAY)
                 self.asks.add(self.ask_id)
-                self.logger.info(f"sending sell order({self.ask_id}) at {self.ask_price} of size {order_size}")
         finally:
             self.order_lock.release()
-        self.logger.info(f"received order book for instrument {instrument} with sequence number {sequence_number}")
 
     def calculate_sides_capital(self):
         fut_buy = self._get_total_capital(*self.fut_book[Side.BID])
@@ -261,8 +257,7 @@ class AutoTrader(BaseAutoTrader):
             should_wait = False
             if client_order_id in self.bids:
                 self.position += volume
-                fut_orders = self.fut_ask_orders.keys()
-                for id in fut_orders:
+                for id in self.fut_ask_orders.keys():
                     if id in self.completed_ids:
                         self.fut_ask_orders.pop(id)
                     else:
@@ -276,13 +271,11 @@ class AutoTrader(BaseAutoTrader):
                     fut_vol = min(volume, abs(-POSITION_LIMIT - self.fut_position))
                     self.send_hedge_order(order_id, Side.ASK, price, fut_vol)
                     self.fut_ask_orders[order_id] = volume
-                    self.logger.info(f"sending future sell order({order_id}) of price {price} and size {fut_vol}")
 
             elif client_order_id in self.asks:
                 self.position -= volume
-                fut_orders = self.fut_bid_orders.keys()
                 
-                for id in fut_orders:
+                for id in self.fut_bid_orders.keys():
                     if id in self.completed_ids:
                         self.fut_bid_orders.pop(id)
                     else:
@@ -294,13 +287,10 @@ class AutoTrader(BaseAutoTrader):
                     order_id = next(self.order_ids)
                     price -= (FUT_PREMIUM_FACTOR * MIN_BID_NEAREST_TICK)
                     fut_vol = min(volume, abs(POSITION_LIMIT - self.fut_position))
-                    self.send_hedge_order(order_id, Side.BID, price, volume)
+                    self.send_hedge_order(order_id, Side.BID, price, fut_vol)
                     self.fut_bid_orders[order_id] = volume
-                    self.logger.info(f"sending future buy order({order_id}) of price {price} and size {volume}")
         finally:
             self.order_lock.release()
-        
-        self.logger.info(f"received order({client_order_id} filled of price {price} and volume {volume}")       
         
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
@@ -323,9 +313,6 @@ class AutoTrader(BaseAutoTrader):
             # It could be either a bid or an ask
             self.bids.discard(client_order_id)
             self.asks.discard(client_order_id)
-
-        self.logger.info(f"received order({client_order_id}) status with fill volume {fill_volume} "
-                         f"remaining {remaining_volume} and fees {fees}")
 
     def on_trade_ticks_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
